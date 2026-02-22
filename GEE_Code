@@ -1,0 +1,207 @@
+
+// Load Plot Data to visually check on map
+
+var all_stands = ee.FeatureCollection(
+  'projects/new-mexico-time-series/assets/all_stands'
+);
+// Feature collection is a vector dataset containing
+// point data of the plot locations
+print('All stands:', all_stands); // Print the collection
+print('Number of features:', all_stands.size()); // Count plots
+
+Map.centerObject(all_stands, 10); // Zoom and center the map
+Map.addLayer(all_stands, {color: 'red'}, 'All Stands'); // Make plots red
+
+// Buffer plots by 15 m (~1 Landsat pixel = 30m)
+var plots = all_stands.map(function(f) {
+  return f.buffer(15);
+});
+
+Map.addLayer(plots, {color: 'blue'}, 'Buffered plots'); // Make buffers blue
+
+
+// Landsat Collection 2 Cloud Mask + Scaling
+
+function maskLandsatSR(image) {
+// Isolate the bitwise pixel quality assessment band from Landsat Collection 2
+  var qa = image.select('QA_PIXEL'); // Use bitwise operators 1, 3 and 4
+
+  // Collection 2 bit flags
+  var dilatedCloud = 1 << 1;
+  var cirrus       = 1 << 2;
+  var cloud        = 1 << 3;
+  var cloudShadow  = 1 << 4;
+// Keep pixels where NOT cloud, shadow, cirrus, etc.
+  var mask = qa.bitwiseAnd(dilatedCloud).eq(0) 
+    .and(qa.bitwiseAnd(cirrus).eq(0))
+    .and(qa.bitwiseAnd(cloud).eq(0))
+    .and(qa.bitwiseAnd(cloudShadow).eq(0));
+
+  return image
+    .updateMask(mask) // apply the mask
+    .select( // Rename the bands. We are in '89 - '12, so L5 & 7
+      ['SR_B1','SR_B3','SR_B4','SR_B5'],  // Valid for Landsat 5 & 7
+      ['Blue','Red','NIR','SWIR1']
+    ) /*
+Next, apply Landsat Collection 2 scale factor:
+So you have raw Landsat Collection 2 Digital Numbers (DN)
+DN are stored as 16-bit integers
+Convert the DN into Surface Reflectance (SR) values, or:
+Convert the pixel value to a reflectance unit.
+*/
+    .multiply(0.0000275)
+    .add(-0.2) 
+    // Preserve the metadata, because previous operations returned a new collection of images
+// This data will be crucial later for the time series analyses
+    .copyProperties(image, ['system:time_start', 'SPACECRAFT_ID']);
+}
+
+
+// Time Series Parameters
+// Define date range for time series analysis period
+var startYear = 1989;
+var endYear   = 2012;
+
+var startDate = startYear + '-05-01';
+var endDate   = endYear   + '-07-31';
+
+
+// Load Landsat 5 and 7 Collections
+
+// Landsat 5 Surface Reflectance
+var lt5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+  .filterDate(startDate, endDate) // Keep only images from May, June, July
+  .filterBounds(plots) // Keep images that intersect with plots + buffer
+  .map(maskLandsatSR);
+// Repeating for Landsat 7 Surface Reflectance
+var le7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+  .filterDate(startDate, endDate)
+  .filterBounds(plots)
+  .map(maskLandsatSR);
+
+// Merge collections
+var landsat = lt5.merge(le7);
+
+
+// Add Vegetation Indices
+
+function addIndices(image) {
+// To measure vegetation greenness, NDVI = (NIR - Red)/(NIR + Red)
+  var ndvi = image.normalizedDifference(['NIR','Red'])
+    .rename('NDVI');
+// To measure more water stress, MSI = SWIR1/NIR
+  var msi = image.select('SWIR1')
+    .divide(image.select('NIR'))
+    .rename('MSI');
+// To measure more leaf stress, PSRI = (Red - Blue)/NIR
+  var psri = image.select('Red')
+    .subtract(image.select('Blue'))
+    .divide(image.select('NIR'))
+    .rename('PSRI');
+// Add the indices to each image
+  return image.addBands([ndvi, msi, psri]);
+}
+// Apply indices to the entire collection
+landsat = landsat.map(addIndices);
+
+
+// Create Annual May–July Median Composites
+// For my analysis, I will create annual composites, not monthly.
+var years = ee.List.sequence(startYear, endYear);
+
+var annualComposites = ee.ImageCollection(
+  years.map(function(y) {
+// Loop through each of the years, 1989 through 2013
+    var start = ee.Date.fromYMD(y, 5, 1);
+    var end   = ee.Date.fromYMD(y, 7, 31);
+// Calculate a pixel-wise median
+    var composite = landsat
+      .filterDate(start, end)
+      .median()
+      .set({
+        year: y,
+        'system:time_start': start.millis()
+      });
+
+    return composite;
+  })
+);
+
+
+// Extract Plot-Level Statistics
+
+var annualTS = annualComposites.map(function(image) {
+// For each yearly composite,
+  var year = image.get('year');
+// and each buffered plot,
+  var stats = image.reduceRegions({
+    collection: plots,
+    reducer: ee.Reducer.mean(),
+    scale: 30,
+    tileScale: 4
+  });
+// calculate mean NDVI, MSI, PSRI.
+// And add the year to every plot record.
+  return stats.map(function(f) {
+    return f.set('year', year);
+  });
+
+}).flatten(); 
+// flattens collection of collections into one FeatureCollection (table)
+
+// Remove empty results
+annualTS = annualTS.filter(ee.Filter.notNull(['NDVI']));
+
+
+// Select Final Columns (which you want to keep for analysis)
+
+var finalTS = annualTS.select([
+  'PNTID',
+  'PLOT',
+  'STAND',
+  'year',
+  'NDVI',
+  'MSI',
+  'PSRI'
+]);
+// Preview will provide a check of the row count, # of plots, + more...
+print('Preview:', finalTS.limit(10));
+print('Total Rows:', finalTS.size());
+print('Unique Plots:', finalTS.aggregate_count_distinct('PNTID'));
+
+
+// Export the table to Google Drive as a CSV
+
+Export.table.toDrive({
+  collection: finalTS,
+  description: 'Landsat_MJJ_Median_1989_2012_AllPlots',
+  fileFormat: 'CSV'
+});
+
+/* 
+Note that the final will have annual medians of NDVI, MSI and PSRI for each plot.
+Month-wise data is not preserved for the purposes of the intended analysis.
+Next, we will export one shapefile per year to visualize vegetation indices 
+at the plots throughout the time series.
+*/ 
+
+// Export One Shapefile Per Year (in a loop)
+
+years.evaluate(function(yearList) { // obtain the year list from server to client
+// GEE objects are server-side, and normal JavaScipt objects are client-side
+// The 'evaluate' above asks the exports to be created client-side
+
+  yearList.forEach(function(y) { // use the yearList in a for loop
+
+    var yearly = finalTS.filter(ee.Filter.eq('year', y));
+// run loop once per year
+// So for each year, create a new FeatureCollection containing all plots for that year
+    Export.table.toDrive({ // Creates a new export task per year
+      collection: yearly,
+      description: 'Plots_' + y, // Plots named by year for easy reading later
+      fileFormat: 'SHP'// Shapefile
+    });
+
+  });
+
+});
